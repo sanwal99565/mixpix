@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-MiniPix V2 → Telegram Bot (Per-user Groq API key support)
+MiniPix V2 Telegram Bot
+- Per-user Groq API key
+- Multi-model support (openai/gpt-oss-120b first)
+- Log Channel for quiz + watch
 """
 
 import os
@@ -9,8 +12,9 @@ import time
 import re
 import logging
 import asyncio
+import threading
 from datetime import date
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, List
 
 import requests
 from telegram import (
@@ -39,10 +43,19 @@ MAX_WATCHES_PER_EP = 4
 REWARDS_BY_WATCH = {1: 15, 2: 8, 3: 5, 4: 3}
 QUIZ_QUESTION_DELAY = 8
 
-# Global fallback (optional)
 GLOBAL_GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "llama-3.3-70b-versatile"   # reliable free model
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")  # e.g. -100xxxxxxxxxx
+
+# Models in priority order
+GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "meta-llama/llama-prompt-guard-2-86m",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+]
 
 HEADERS_BASE = {
     "user-agent": "okhttp/4.12.0",
@@ -56,13 +69,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation states
-(
-    WAIT_PHONE,
-    WAIT_OTP,
-    WAIT_TOKEN,
-    WAIT_QUIZ_SESSIONS,
-    WAIT_QUIZ_DELAY,
-) = range(5)
+(WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS, WAIT_QUIZ_DELAY) = range(5)
+
+
+# ───────────────────── Log Channel Helper ─────────────────────
+def send_log_sync(text: str):
+    """Send log to channel (works from any thread)"""
+    if not LOG_CHANNEL_ID or not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": LOG_CHANNEL_ID,
+                "text": text[:4000],
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning(f"Log channel error: {e}")
 
 
 # ───────────────────── User Groq Keys ─────────────────────
@@ -81,14 +108,13 @@ def save_user_groq_keys(data: dict):
         with open(USER_GROQ_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"Failed to save user groq keys: {e}")
+        logger.error(f"Failed to save groq keys: {e}")
 
 
 user_groq_keys: dict = load_user_groq_keys()
 
 
 def get_user_groq_key(user_id: int) -> Optional[str]:
-    """Return user-specific key first, then global fallback."""
     key = user_groq_keys.get(str(user_id))
     if key:
         return key
@@ -211,8 +237,7 @@ class MiniPixV2:
         self.phone = phone
         payload = {"phone_number": phone}
         sc, data = self._req(
-            "POST",
-            "/login/generate-otp",
+            "POST", "/login/generate-otp",
             headers={"content-type": "application/json; charset=utf-8"},
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
@@ -232,8 +257,7 @@ class MiniPixV2:
             "session_token": session_token,
         }
         sc, data = self._req(
-            "POST",
-            "/login/verify-otp",
+            "POST", "/login/verify-otp",
             headers={"content-type": "application/json; charset=utf-8"},
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
@@ -313,10 +337,8 @@ class MiniPixV2:
             return
         if isinstance(obj, dict):
             if (obj.get("_id") or obj.get("id") or obj.get("series_id")) and (
-                obj.get("title")
-                or obj.get("numberOfEpisodes") is not None
-                or obj.get("totalEpisodes") is not None
-                or obj.get("cardImage")
+                obj.get("title") or obj.get("numberOfEpisodes") is not None
+                or obj.get("totalEpisodes") is not None or obj.get("cardImage")
                 or obj.get("hindiTitle")
             ):
                 sid = obj.get("_id") or obj.get("id") or obj.get("series_id")
@@ -351,7 +373,7 @@ class MiniPixV2:
             ("GET", "/home?page={p}&pageSize={ps}", False),
             ("GET", "/discover/webseries?page={p}&pageSize={ps}", True),
         ]
-        for method, tmpl, is_series_list in endpoints:
+        for method, tmpl, _ in endpoints:
             for page in range(1, max_pages + 1):
                 url = tmpl.format(p=page, ps=page_size)
                 try:
@@ -383,15 +405,13 @@ class MiniPixV2:
 
         series_list = list(found.values())
         series_list.sort(
-            key=lambda s: -int(s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0),
-            reverse=False,
+            key=lambda s: -int(s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0)
         )
         return series_list
 
     def get_episodes(self, series_id, page=1, page_size=50):
         sc, data = self._req(
-            "GET",
-            f"/episodes?series_id={series_id}&page={page}&pageSize={page_size}",
+            "GET", f"/episodes?series_id={series_id}&page={page}&pageSize={page_size}"
         )
         if sc == 200 and isinstance(data, dict):
             return data.get("episodes", []), data.get("total", 0)
@@ -652,10 +672,15 @@ class MiniPixV2:
         self.runtime_watch_counts[rk] = self.runtime_watch_counts.get(rk, 0) + 1
         return True, "done"
 
-    def browse_and_watch_all_smart_repeat(self, progress_callback=None, max_watches=250):
+    def browse_and_watch_all_smart_repeat(self, progress_callback=None, max_watches=250, telegram_user_id=None):
         def log(msg):
             if progress_callback:
                 progress_callback(msg)
+            # also send important logs to channel
+            if "→" in msg or "finished" in msg.lower() or "Campaign" in msg or "Fetching" in msg:
+                send_log_sync(
+                    f"<b>🎬 WATCH</b> | User <code>{telegram_user_id}</code>\n{msg}"
+                )
 
         log("Checking campaign...")
         cap = self.get_campaign_status()
@@ -720,12 +745,20 @@ class MiniPixV2:
             except Exception:
                 pass
             if done:
-                log(f"  → {done} watches")
+                log(f"  → {done} watches done")
 
         bal_end = self.get_balance_silent()
         delta = None
         if balance_before is not None and bal_end is not None:
             delta = bal_end - balance_before
+
+        summary = (
+            f"<b>🏁 WATCH FINISHED</b>\n"
+            f"User: <code>{telegram_user_id}</code>\n"
+            f"Watched: {total_watched} | Skipped: {total_skipped} | Failed: {total_failed}\n"
+            f"Balance: {balance_before} → {bal_end} ({delta:+d})" if delta is not None else ""
+        )
+        send_log_sync(summary)
 
         return {
             "watched": total_watched,
@@ -823,43 +856,57 @@ class MiniPixV2:
             return None
 
         prompt = self._build_quiz_prompt(question, options)
-        try:
-            from groq import Groq
-            client = Groq(api_key=api_key)
-            completion = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=20,
-            )
-            answer_text = (completion.choices[0].message.content or "").strip()
-            return self._parse_quiz_answer(answer_text, options)
-        except Exception as e:
-            logger.warning(f"Groq error: {e}")
-            # HTTP fallback
-            try:
-                r = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": GROQ_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "max_tokens": 20,
-                    },
-                    timeout=40,
-                )
-                if r.status_code == 200:
-                    answer_text = r.json()["choices"][0]["message"]["content"].strip()
-                    return self._parse_quiz_answer(answer_text, options)
-            except Exception:
-                pass
-            return None
 
-    def run_quiz_auto(self, max_sessions=3, question_delay=8, progress_callback=None, telegram_user_id=None):
+        for model in GROQ_MODELS:
+            try:
+                from groq import Groq
+                client = Groq(api_key=api_key)
+                completion = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=30,
+                )
+                answer_text = (completion.choices[0].message.content or "").strip()
+                idx = self._parse_quiz_answer(answer_text, options)
+                if idx is not None:
+                    logger.info(f"Groq success with model: {model}")
+                    return idx
+            except Exception as e:
+                logger.warning(f"Model {model} failed: {e}")
+                continue
+
+        # HTTP fallback
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODELS[0],
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 30,
+                },
+                timeout=40,
+            )
+            if r.status_code == 200:
+                answer_text = r.json()["choices"][0]["message"]["content"].strip()
+                return self._parse_quiz_answer(answer_text, options)
+        except Exception as e:
+            logger.warning(f"HTTP fallback failed: {e}")
+
+        return None
+
+    def run_quiz_auto(
+        self,
+        max_sessions=3,
+        question_delay=8,
+        progress_callback=None,
+        telegram_user_id=None,
+    ):
         def log(msg):
             if progress_callback:
                 progress_callback(msg)
@@ -874,11 +921,18 @@ class MiniPixV2:
         total_coins = 0
         sessions_done = 0
 
+        send_log_sync(
+            f"<b>🧠 QUIZ STARTED</b>\n"
+            f"User: <code>{telegram_user_id}</code>\n"
+            f"Sessions: {max_sessions} | Delay: {question_delay}s"
+        )
+
         for session_num in range(1, max_sessions + 1):
             log(f"--- Session {session_num}/{max_sessions} ---")
             session_id, question_obj, session_meta = self.quiz_start_session()
             if not session_id or not question_obj:
                 log("Failed to start session")
+                send_log_sync(f"❌ Session start failed | User <code>{telegram_user_id}</code>")
                 break
 
             hearts = session_meta.get("hearts", 3) if session_meta else 3
@@ -905,20 +959,21 @@ class MiniPixV2:
                 if q_text_en and q_text_en != q_text_hi:
                     combined = f"{q_text_hi}\n[EN: {q_text_en}]" if q_text_hi else q_text_en
 
-                log(f"Q{q_idx+1}/{q_total}: {(q_text_hi or q_text_en)[:80]}")
+                short_q = (q_text_hi or q_text_en)[:90]
+                log(f"Q{q_idx+1}/{q_total}: {short_q}")
 
                 if not q_id or len(options) < 2:
                     break
 
                 correct_index = self.ask_groq(combined, options, telegram_user_id=telegram_user_id)
                 if correct_index is None:
-                    # try lifeline then guess
                     removed = self.quiz_use_lifeline(session_id, q_id) or []
                     remaining = [i for i in range(len(options)) if i not in set(removed)]
                     correct_index = remaining[0] if remaining else 0
 
                 correct_index = max(0, min(correct_index, len(options) - 1))
-                log(f"  → [{correct_index}] {options[correct_index][:40]}")
+                chosen_text = options[correct_index][:50]
+                log(f"  → [{correct_index}] {chosen_text}")
 
                 time.sleep(question_delay)
 
@@ -932,8 +987,17 @@ class MiniPixV2:
                     session_coins = result.get("coinsSoFar", 0)
                     hearts = int(result.get("hearts", hearts))
                     total_coins += coins_earned
-                    status_txt = "✅" if correct_flag else "❌"
+                    status_txt = "✅ CORRECT" if correct_flag else "❌ WRONG"
+
                     log(f"  {status_txt} +{coins_earned} | hearts={hearts}")
+
+                    # Detailed log to channel
+                    send_log_sync(
+                        f"<b>Quiz Q{q_idx+1}</b> | User <code>{telegram_user_id}</code>\n"
+                        f"{short_q}\n"
+                        f"Chosen: [{correct_index}] {chosen_text}\n"
+                        f"{status_txt} | +{coins_earned} | ❤️ {hearts}"
+                    )
 
                     next_info = result.get("next")
                     if not next_info:
@@ -962,6 +1026,15 @@ class MiniPixV2:
             if session_num < max_sessions:
                 time.sleep(2)
 
+        final = (
+            f"<b>🏁 QUIZ FINISHED</b>\n"
+            f"User: <code>{telegram_user_id}</code>\n"
+            f"Sessions: {sessions_done}\n"
+            f"Coins earned: ~{total_coins}\n"
+            f"Balance now: {self.get_balance()}"
+        )
+        send_log_sync(final)
+
         return {
             "sessions": sessions_done,
             "total_coins": total_coins,
@@ -969,7 +1042,7 @@ class MiniPixV2:
         }
 
 
-# ───────────────────── Per-user bot instances ─────────────────────
+# ───────────────────── Per-user instances ─────────────────────
 user_bots: Dict[int, MiniPixV2] = {}
 
 
@@ -999,7 +1072,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"👋 Hi {user.first_name}!\n\n"
         "MiniPix V2 Bot ready.\n\n"
-        "• /setgroq – apna Groq API key set karo (quiz ke liye)\n"
+        "• /setgroq – apna Groq API key set karo\n"
         "• /login – account login\n"
         "• /watch – 4x watch\n"
         "• /quiz – quiz status\n"
@@ -1024,7 +1097,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setgroq `gsk_xxx` – apna Groq key set karo\n"
         "/mygroq – check if key is set\n"
         "/logout – logout\n\n"
-        "Groq key free lo: https://console.groq.com/keys",
+        "Groq key free: https://console.groq.com/keys",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
@@ -1034,31 +1107,30 @@ async def set_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "Usage:\n`/setgroq gsk_your_key_here`\n\n"
-            "Free key yahan se banao:\nhttps://console.groq.com/keys",
+            "Free key: https://console.groq.com/keys",
             parse_mode="Markdown",
         )
         return
 
     key = context.args[0].strip()
     if not key.startswith("gsk_"):
-        await update.message.reply_text("❌ Invalid key. Groq key `gsk_` se start hota hai.")
+        await update.message.reply_text("❌ Invalid key. Must start with `gsk_`")
         return
 
     user_id = str(update.effective_user.id)
     user_groq_keys[user_id] = key
     save_user_groq_keys(user_groq_keys)
-    await update.message.reply_text("✅ Aapka Groq API key save ho gaya!\nAb quiz use kar sakte ho.")
+    await update.message.reply_text("✅ Groq API key saved!\nAb quiz use kar sakte ho.")
 
 
 async def my_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = get_user_groq_key(update.effective_user.id)
     if key:
-        masked = key[:8] + "..." + key[-4:]
-        await update.message.reply_text(f"✅ Key set hai: `{masked}`", parse_mode="Markdown")
+        masked = key[:10] + "..." + key[-4:]
+        await update.message.reply_text(f"✅ Key set: `{masked}`", parse_mode="Markdown")
     else:
         await update.message.reply_text(
-            "❌ Koi Groq key set nahi hai.\n\n"
-            "Set karne ke liye:\n`/setgroq gsk_xxxxxxxx`",
+            "❌ Koi key set nahi hai.\n\n`/setgroq gsk_xxxxxxxx`",
             parse_mode="Markdown",
         )
 
@@ -1159,7 +1231,7 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
     st = bot.login_otp_generate(phone)
     if not st:
-        await update.message.reply_text("OTP bhejne me fail. Dobara try karo.")
+        await update.message.reply_text("OTP bhejne me fail.")
         return ConversationHandler.END
     context.user_data["session_token"] = st
     await update.message.reply_text(f"OTP sent to {phone}\nAb OTP bhejo:")
@@ -1181,6 +1253,7 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Login success!\n💰 Balance: {bal}",
             reply_markup=main_menu_keyboard(),
         )
+        send_log_sync(f"✅ Login success | User <code>{update.effective_user.id}</code> | Balance: {bal}")
     else:
         await update.message.reply_text("❌ OTP verify failed.")
     return ConversationHandler.END
@@ -1199,6 +1272,7 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Token login success!\n💰 Balance: {bal}",
             reply_markup=main_menu_keyboard(),
         )
+        send_log_sync(f"✅ Token login | User <code>{update.effective_user.id}</code> | Balance: {bal}")
     else:
         await update.message.reply_text("❌ Invalid / expired token.")
     return ConversationHandler.END
@@ -1216,18 +1290,25 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Not logged in. Use /login")
         return
 
+    uid = update.effective_user.id
     msg = await update.message.reply_text("🚀 Starting smart 4x watch...\nThoda time lagega.")
 
     def progress(text):
         try:
-            asyncio.create_task(msg.edit_text(f"🚀 Watching...\n\n{text[-900:]}"))
+            asyncio.get_event_loop().create_task(
+                msg.edit_text(f"🚀 Watching...\n\n{text[-900:]}")
+            )
         except Exception:
             pass
 
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
         None,
-        lambda: bot.browse_and_watch_all_smart_repeat(progress_callback=progress, max_watches=250),
+        lambda: bot.browse_and_watch_all_smart_repeat(
+            progress_callback=progress,
+            max_watches=250,
+            telegram_user_id=uid,
+        ),
     )
 
     if "error" in result:
@@ -1278,7 +1359,6 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Not logged in.")
         return ConversationHandler.END
 
-    # Check if user has Groq key
     if not get_user_groq_key(update.effective_user.id):
         await update.message.reply_text(
             "❌ Pehle apna Groq API key set karo:\n\n"
@@ -1299,7 +1379,9 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         n = 3
     context.user_data["quiz_sessions"] = n
-    await update.message.reply_text(f"Har question ke beech delay (seconds)? (default {QUIZ_QUESTION_DELAY}):")
+    await update.message.reply_text(
+        f"Har question ke beech delay (seconds)? (default {QUIZ_QUESTION_DELAY}):"
+    )
     return WAIT_QUIZ_DELAY
 
 
@@ -1318,7 +1400,9 @@ async def quiz_delay_and_run(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     def progress(text):
         try:
-            asyncio.create_task(msg.edit_text(f"🤖 Quiz running...\n\n{text[-900:]}"))
+            asyncio.get_event_loop().create_task(
+                msg.edit_text(f"🤖 Quiz running...\n\n{text[-900:]}")
+            )
         except Exception:
             pass
 
@@ -1351,7 +1435,6 @@ async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Logged out.", reply_markup=main_menu_keyboard())
 
 
-# Text button router
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text == "💰 Balance":
@@ -1382,12 +1465,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("ERROR: Set TELEGRAM_BOT_TOKEN environment variable")
+        print("ERROR: Set TELEGRAM_BOT_TOKEN")
         return
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Login conversation
     login_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],
         states={
@@ -1399,7 +1481,6 @@ def main():
         allow_reentry=True,
     )
 
-    # Quiz conversation
     quiz_conv = ConversationHandler(
         entry_points=[
             CommandHandler("quizrun", quiz_run_start),
@@ -1430,6 +1511,10 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     print("Bot starting...")
+    if LOG_CHANNEL_ID:
+        print(f"Log channel enabled: {LOG_CHANNEL_ID}")
+    else:
+        print("WARNING: LOG_CHANNEL_ID not set – no logs will be sent")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
