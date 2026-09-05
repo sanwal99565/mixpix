@@ -2,10 +2,10 @@
 """
 MiniPix V2 Telegram Bot
 - Per-user Groq API key
-- Only available models
-- Detailed quiz debug logs (question, options, model answer)
+- Uses openai/gpt-oss-120b as primary model, others as fallback
 - Lock file to avoid multiple instances
-- Quiz sessions 10–25 (default 15), fixed 10s delay
+- Quiz sessions 10–25 (default 15), 10s delay
+- Detailed quiz debug (question, options, model answer, result)
 """
 
 import os
@@ -51,7 +51,7 @@ GLOBAL_GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
 
-# Only models available on your account
+# Primary model + fallbacks
 GROQ_MODELS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
@@ -76,7 +76,6 @@ logger = logging.getLogger(__name__)
 
 # ───────────────────── Lock file ─────────────────────
 def acquire_lock():
-    """Prevent multiple bot instances."""
     try:
         fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.close(fd)
@@ -787,7 +786,7 @@ class MiniPixV2:
             "delta": delta,
         }
 
-    # ── Quiz ──
+    # ── QUIZ (improved from standalone script) ──
     def get_quiz_status(self):
         sc, data = self._req("GET", "/quiz/status")
         if sc == 200 and isinstance(data, dict) and data.get("success"):
@@ -847,14 +846,16 @@ class MiniPixV2:
 
     def _build_quiz_prompt(self, question, options):
         prompt = (
-            "Multiple choice question. Choose the correct option.\n"
-            "Reply with ONLY the option number (0, 1, 2 or 3).\n\n"
-            f"Question:\n{question}\n\n"
+            "Solve this multiple-choice question. "
+            "Return ONLY the integer index of the correct option (0, 1, 2, ...). "
+            "No explanation, no extra words, just a single digit integer.\n\n"
+            f"Question (both Hindi and English provided):\n"
+            f"{question}\n\n"
             "Options:\n"
         )
         for i, opt in enumerate(options):
-            prompt += f"{i}. {opt}\n"
-        prompt += "\nCorrect option number:"
+            prompt += f"  {i}: {opt}\n"
+        prompt += "\nCorrect option index (integer only): "
         return prompt
 
     def _parse_quiz_answer(self, answer_text, options):
@@ -866,16 +867,28 @@ class MiniPixV2:
             idx = int(m.group(1))
             if 0 <= idx < len(options):
                 return idx
+        # fallback: if answer contains option text
+        for i, opt in enumerate(options):
+            opt_clean = str(opt).strip().lower()
+            if opt_clean and opt_clean in t.lower():
+                return i
+        # try "option X"
+        m2 = re.search(r"option\s*(\d+)", t, flags=re.IGNORECASE)
+        if m2:
+            idx = int(m2.group(1))
+            if 1 <= idx <= len(options):
+                return idx - 1
         return None
 
     def ask_groq(self, question, options, telegram_user_id: int = None):
         api_key = get_user_groq_key(telegram_user_id) if telegram_user_id else GLOBAL_GROQ_API_KEY
         if not api_key:
             send_log_sync(f"❌ No Groq key for user <code>{telegram_user_id}</code>")
-            return None
+            return None, None, None
 
         prompt = self._build_quiz_prompt(question, options)
 
+        # Try each model, including primary first
         for model in GROQ_MODELS:
             try:
                 from groq import Groq
@@ -902,8 +915,11 @@ class MiniPixV2:
                 answer_text = (completion.choices[0].message.content or "").strip()
                 idx = self._parse_quiz_answer(answer_text, options)
 
-                # Return also the model name and raw answer for debug
-                return idx, model, answer_text
+                if idx is not None:
+                    return idx, model, answer_text
+                else:
+                    # If parse fails, try one more time without system prompt?
+                    continue
 
             except Exception as e:
                 err = str(e).lower()
@@ -913,7 +929,7 @@ class MiniPixV2:
                 logger.warning(f"Model {model} failed: {e}")
                 continue
 
-        # HTTP fallback
+        # HTTP fallback (primary model)
         try:
             r = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -922,7 +938,7 @@ class MiniPixV2:
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "openai/gpt-oss-120b",
+                    "model": GROQ_MODELS[0],  # primary
                     "messages": [
                         {
                             "role": "system",
@@ -938,9 +954,8 @@ class MiniPixV2:
             if r.status_code == 200:
                 answer_text = r.json()["choices"][0]["message"]["content"].strip()
                 idx = self._parse_quiz_answer(answer_text, options)
-                return idx, "http-fallback", answer_text
-            else:
-                send_log_sync(f"HTTP Error {r.status_code}: {r.text[:200]}")
+                if idx is not None:
+                    return idx, "http-fallback", answer_text
         except Exception as e:
             send_log_sync(f"HTTP fallback error: {e}")
 
@@ -966,7 +981,7 @@ class MiniPixV2:
 
         total_coins = 0
         sessions_done = 0
-        debug_lines = []   # store last few debug lines for user
+        debug_lines = []
 
         send_log_sync(
             f"🧠 QUIZ STARTED | User <code>{telegram_user_id}</code> | Sessions: {max_sessions}"
@@ -1007,14 +1022,14 @@ class MiniPixV2:
                     combined = f"{q_text_hi}\n[EN: {q_text_en}]" if q_text_hi else q_text_en
 
                 short_q = (q_text_hi or q_text_en)[:120]
-                # Build debug line start
-                debug_line = f"Q{q_idx+1}/{q_total}: {short_q}"
 
                 if not q_id or len(options) < 2:
                     break
 
                 # Ask Groq
-                correct_index, model_used, raw_answer = self.ask_groq(combined, options, telegram_user_id=telegram_user_id)
+                correct_index, model_used, raw_answer = self.ask_groq(
+                    combined, options, telegram_user_id=telegram_user_id
+                )
                 if correct_index is None:
                     removed = self.quiz_use_lifeline(session_id, q_id) or []
                     remaining = [i for i in range(len(options)) if i not in set(removed)]
@@ -1059,15 +1074,11 @@ class MiniPixV2:
                         f"+{coins_earned}¢ | hearts {hearts}"
                     )
 
-                    # Send to log channel
                     send_log_sync(f"<b>{debug_line}</b>")
-
-                    # Add to local debug lines for user (keep last 15)
                     debug_lines.append(debug_line)
                     if len(debug_lines) > 15:
                         debug_lines.pop(0)
 
-                    # Update user message with current debug lines
                     user_debug = "\n".join(debug_lines)
                     log(f"--- Quiz running ---\n{user_debug}")
 
@@ -1083,18 +1094,25 @@ class MiniPixV2:
                             continue
                         if "result" in next_info:
                             break
+                        # Sometimes next is directly the question
+                        if next_info.get("questionId"):
+                            question_obj = next_info
+                            session_id = result.get("sessionId") or session_id
+                            continue
 
+                    # Ad gate
                     if q_count > 0 and ad_every > 0 and (q_count % ad_every == 0):
                         nq = self.quiz_ad_ack(session_id)
-                        if nq:
+                        if nq and isinstance(nq, dict):
                             question_obj = nq
                             continue
-                        break
+                        else:
+                            break
+
                     break
                 else:
                     break
 
-            # Per‑session summary
             session_summary = (
                 f"🏁 Session {session_num} finished\n"
                 f"Questions: {q_count}  |  Correct: {correct_count}  |  Wrong: {wrong_count}\n"
@@ -1458,7 +1476,6 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         n = 15
     context.user_data["quiz_sessions"] = n
 
-    # Directly start quiz with fixed delay = 10
     bot = get_bot(update.effective_user.id)
     sessions = context.user_data.get("quiz_sessions", 15)
     telegram_uid = update.effective_user.id
@@ -1531,7 +1548,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    # Prevent multiple instances
     acquire_lock()
 
     if not TELEGRAM_BOT_TOKEN:
