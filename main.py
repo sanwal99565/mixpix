@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-MiniPix V2 → Telegram Bot
-Requires:
-  pip install python-telegram-bot==21.6 requests groq
-  export TELEGRAM_BOT_TOKEN="your_bot_token"
-  export GROQ_API_KEY="your_groq_key"
+MiniPix V2 → Telegram Bot (Per-user Groq API key support)
 """
 
 import os
@@ -12,8 +8,9 @@ import json
 import time
 import re
 import logging
+import asyncio
 from datetime import date
-from typing import Optional, Dict, Any
+from typing import Dict, Optional, Any
 
 import requests
 from telegram import (
@@ -35,14 +32,16 @@ from telegram.ext import (
 
 # ───────────────────────── Config ─────────────────────────
 API_BASE = "https://api.minipix.co/v4"
-ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "minipix_accounts.json")
+ACCOUNTS_FILE = "minipix_accounts.json"
+USER_GROQ_FILE = "user_groq_keys.json"
 
 MAX_WATCHES_PER_EP = 4
 REWARDS_BY_WATCH = {1: 15, 2: 8, 3: 5, 4: 3}
 QUIZ_QUESTION_DELAY = 8
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "openai/gpt-oss-120b"
+# Global fallback (optional)
+GLOBAL_GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = "llama-3.3-70b-versatile"   # reliable free model
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 HEADERS_BASE = {
@@ -61,17 +60,42 @@ logger = logging.getLogger(__name__)
     WAIT_PHONE,
     WAIT_OTP,
     WAIT_TOKEN,
-    WAIT_LABEL,
     WAIT_QUIZ_SESSIONS,
     WAIT_QUIZ_DELAY,
-) = range(6)
+) = range(5)
 
 
-def _expected_reward(nth_watch):
-    return REWARDS_BY_WATCH.get(int(nth_watch) if nth_watch else 1, 0)
+# ───────────────────── User Groq Keys ─────────────────────
+def load_user_groq_keys() -> dict:
+    if os.path.exists(USER_GROQ_FILE):
+        try:
+            with open(USER_GROQ_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
 
-# ───────────────────── MiniPix Core (same logic) ─────────────────────
+def save_user_groq_keys(data: dict):
+    try:
+        with open(USER_GROQ_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Failed to save user groq keys: {e}")
+
+
+user_groq_keys: dict = load_user_groq_keys()
+
+
+def get_user_groq_key(user_id: int) -> Optional[str]:
+    """Return user-specific key first, then global fallback."""
+    key = user_groq_keys.get(str(user_id))
+    if key:
+        return key
+    return GLOBAL_GROQ_API_KEY or None
+
+
+# ───────────────────── MiniPix Core ─────────────────────
 class MiniPixV2:
     def __init__(self):
         self.access_token = None
@@ -113,7 +137,7 @@ class MiniPixV2:
     def _store_current_account(self, label=None):
         if not (self.access_token and self.user_id):
             return False
-        lbl = label or self.phone or self.current_account_label or f"acc_{self.user_id[-6:]}"
+        lbl = label or self.phone or self.current_account_label or f"acc_{str(self.user_id)[-6:]}"
         self.current_account_label = lbl
         self.accounts[lbl] = {
             "access_token": self.access_token,
@@ -304,14 +328,10 @@ class MiniPixV2:
             for item in obj:
                 self._collect_series_deep(item, out_dict)
 
-    def get_all_series(self, page_size=100, max_pages=15):
+    def get_all_series(self, page_size=100, max_pages=12):
         found = {}
-        home_urls = [("GET", "/short_search?page=home", False)]
-        for method, tmpl, _ in home_urls:
-            try:
-                sc, data = self._req(method, tmpl)
-            except Exception:
-                sc, data = 0, None
+        try:
+            sc, data = self._req("GET", "/short_search?page=home")
             if sc == 200 and isinstance(data, (dict, list)):
                 self._collect_series_deep(data, found)
                 if isinstance(data, dict) and data.get("playlists"):
@@ -322,13 +342,14 @@ class MiniPixV2:
                                     sid = ws.get("_id") or ws.get("id")
                                     if sid and sid not in found:
                                         found[sid] = ws
+        except Exception:
+            pass
 
         endpoints = [
             ("GET", "/webseries?page={p}&pageSize={ps}", True),
             ("GET", "/discover?type=webseries&page={p}&pageSize={ps}", True),
             ("GET", "/home?page={p}&pageSize={ps}", False),
             ("GET", "/discover/webseries?page={p}&pageSize={ps}", True),
-            ("GET", "/series?page={p}&pageSize={ps}", True),
         ]
         for method, tmpl, is_series_list in endpoints:
             for page in range(1, max_pages + 1):
@@ -344,42 +365,27 @@ class MiniPixV2:
                 for k in ("webseries", "series", "data", "items", "results", "contents", "list"):
                     if isinstance(data.get(k), list):
                         series_candidates.extend(data[k])
-                inner = None
-                if isinstance(data.get("data"), dict):
-                    inner = data["data"]
-                elif isinstance(data.get("response"), dict):
-                    inner = data["response"]
+                inner = data.get("data") if isinstance(data.get("data"), dict) else None
                 if inner:
-                    for k in ("webseries", "series", "items", "results", "contents", "list", "data"):
+                    for k in ("webseries", "series", "items", "results", "contents", "list"):
                         if isinstance(inner.get(k), list):
                             series_candidates.extend(inner[k])
-                if not series_candidates:
-                    if is_series_list and isinstance(data, dict) and (data.get("_id") or data.get("title")):
-                        series_candidates = [data]
                 if not series_candidates:
                     break
                 for s in series_candidates:
                     if not isinstance(s, dict):
                         continue
                     sid = s.get("_id") or s.get("id") or s.get("series_id")
-                    if not sid:
-                        continue
-                    if sid not in found:
+                    if sid and sid not in found:
                         found[sid] = s
-                total_reported = data.get("total") or (inner or {}).get("total") or 0
-                if total_reported and len(found) >= int(total_reported):
-                    break
                 if len(series_candidates) < int(page_size * 0.5):
                     break
+
         series_list = list(found.values())
-
-        def _sort_key(s):
-            try:
-                return -int(s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0)
-            except Exception:
-                return 0
-
-        series_list.sort(key=_sort_key)
+        series_list.sort(
+            key=lambda s: -int(s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0),
+            reverse=False,
+        )
         return series_list
 
     def get_episodes(self, series_id, page=1, page_size=50):
@@ -409,9 +415,11 @@ class MiniPixV2:
                 key = (wh.get("id"), wh.get("episodeNo"))
                 prev = self.watch_history.get(key) or {"watchedPct": 0, "time": 0}
                 cur_pct = wh.get("watchedPct", 0) or 0
-                cur_time = wh.get("time", 0) or 0
                 if cur_pct >= (prev.get("watchedPct") or 0):
-                    self.watch_history[key] = {"watchedPct": cur_pct, "time": cur_time}
+                    self.watch_history[key] = {
+                        "watchedPct": cur_pct,
+                        "time": wh.get("time", 0) or 0,
+                    }
             return profile
         return None
 
@@ -438,13 +446,6 @@ class MiniPixV2:
             if sid and ep and pct >= 80:
                 k = (str(sid), str(ep))
                 counts[k] = counts.get(k, 0) + 1
-        if isinstance(self.watch_history, dict):
-            for (sid, ep_no), info in self.watch_history.items():
-                pct = int(info.get("watchedPct") or 0) if isinstance(info, dict) else 0
-                if pct >= 80:
-                    k = (str(sid), str(ep_no))
-                    if counts.get(k, 0) < 1:
-                        counts[k] = max(counts.get(k, 0), 1)
         runtime = getattr(self, "runtime_watch_counts", None)
         if isinstance(runtime, dict):
             for k, c in runtime.items():
@@ -466,11 +467,9 @@ class MiniPixV2:
         if not tc_out_ms or tc_out_ms <= tc_in_ms:
             tc_out_ms = tc_in_ms + 60000
         duration = tc_out_ms - tc_in_ms
-        if watched_pct >= 100:
-            current_time_ms = tc_out_ms
-        else:
-            current_time_ms = int(tc_in_ms + (duration * watched_pct / 100))
+        current_time_ms = tc_out_ms if watched_pct >= 100 else int(tc_in_ms + (duration * watched_pct / 100))
         stored_pct = 99 if watched_pct == 99 else (100 if watched_pct >= 100 else watched_pct)
+
         watch_obj = {
             "id": series_id,
             "title": series_title,
@@ -485,51 +484,40 @@ class MiniPixV2:
             "watchedPct": stored_pct,
             "campaign": False,
         }
+
         ok1 = False
         try:
-            payload_patch = {"watched": watch_obj}
             sc1, d1 = self._req(
                 "PATCH",
                 f"/users/{self.user_id}/profiles/{self.profile_id}",
                 headers={"content-type": "application/json; charset=utf-8"},
-                data=json.dumps(payload_patch, ensure_ascii=False).encode("utf-8"),
+                data=json.dumps({"watched": watch_obj}, ensure_ascii=False).encode("utf-8"),
             )
             ok1 = sc1 == 200 and isinstance(d1, dict) and d1.get("success")
         except Exception:
             pass
 
         ok2 = False
-        try:
-            for path in (
-                f"/users/{self.user_id}/profiles/{self.profile_id}/watch-history/update",
-                "/watch-history/update",
-                f"/profiles/{self.profile_id}/watch-history/update",
-            ):
-                payload_wh = {"watched": watch_obj, "campaign": False}
+        for path in (
+            f"/users/{self.user_id}/profiles/{self.profile_id}/watch-history/update",
+            "/watch-history/update",
+        ):
+            try:
                 sc2, d2 = self._req(
                     "POST", path,
                     headers={"content-type": "application/json; charset=utf-8"},
-                    data=json.dumps(payload_wh, ensure_ascii=False).encode("utf-8"),
+                    data=json.dumps({"watched": watch_obj, "campaign": False}, ensure_ascii=False).encode("utf-8"),
                 )
-                if sc2 and sc2 < 500:
-                    if isinstance(d2, dict) and d2.get("success"):
-                        ok2 = True
-                        break
-                    if sc2 == 200:
-                        ok2 = True
-                        break
-        except Exception:
-            pass
+                if sc2 and sc2 < 500 and (isinstance(d2, dict) and d2.get("success") or sc2 == 200):
+                    ok2 = True
+                    break
+            except Exception:
+                pass
         return ok1 or ok2
 
     def _report_watch_progress_to_coins(self, series_id, episode_no, watched_pct, series_title=""):
         if not (self.user_id and self.profile_id):
             return False
-        try:
-            watched_pct = int(watched_pct or 0)
-        except Exception:
-            watched_pct = 0
-        ep_str = str(episode_no)
         bodies = [
             {
                 "series_id": series_id,
@@ -543,28 +531,17 @@ class MiniPixV2:
             {
                 "type": "watch_ladder",
                 "seriesId": series_id,
-                "episode": ep_str,
+                "episode": str(episode_no),
                 "watched": watched_pct,
-                "campaign": False,
-            },
-            {
-                "task_id": f"watch_ladder_{series_id}",
-                "progress_delta": 1,
-                "series_id": series_id,
-                "episode_no": episode_no,
                 "campaign": False,
             },
         ]
         endpoints = [
             ("POST", "/coins/progress-report", bodies[0]),
             ("POST", "/coins/tasks/progress", bodies[0]),
-            ("POST", f"/coins/tasks/watch_ladder_{series_id}/progress", bodies[0]),
             ("POST", "/coins/watch-progress", bodies[1]),
-            ("POST", "/coins/report-watched", bodies[1]),
-            ("POST", "/coins/tasks/update", bodies[2]),
             ("POST", "/watch-ladder/progress", bodies[0]),
         ]
-        any_ok = False
         for method, path, body in endpoints:
             try:
                 sc, d = self._req(
@@ -572,13 +549,11 @@ class MiniPixV2:
                     headers={"content-type": "application/json; charset=utf-8"},
                     data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                 )
-                if sc and sc < 500 and isinstance(d, dict):
-                    if d.get("success") is True or (sc == 200 and "success" not in d):
-                        any_ok = True
-                        break
+                if sc and sc < 500 and isinstance(d, dict) and (d.get("success") is True or sc == 200):
+                    return True
             except Exception:
                 continue
-        return any_ok
+        return False
 
     def _start_task_for_series(self, series_id):
         task_id = f"watch_ladder_{series_id}"
@@ -586,10 +561,7 @@ class MiniPixV2:
             ("POST", f"/coins/tasks/{task_id}/start", {"series_id": series_id, "campaign": False}),
             ("POST", "/coins/tasks/start", {"task_id": task_id, "series_id": series_id, "campaign": False}),
             ("POST", "/watch-ladder/start", {"series_id": series_id, "campaign": False}),
-            ("POST", "/coins/start-task", {"task_id": task_id, "campaign": False}),
-            ("POST", f"/coins/tasks/watch_ladder_{series_id}/resume", {}),
         ]
-        any_ok = False
         for method, path, body in candidates:
             try:
                 sc, d = self._req(
@@ -598,42 +570,25 @@ class MiniPixV2:
                     data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                 )
                 if sc and sc < 500:
-                    if isinstance(d, dict) and d.get("success") is True:
-                        any_ok = True
-                        break
-                    if sc == 200:
-                        any_ok = True
-                        break
+                    return True
             except Exception:
                 pass
-        return any_ok
+        return False
 
     def claim_reward_task(self, task_id=None, series_id=None):
         if not task_id and series_id:
             task_id = f"watch_ladder_{series_id}"
-        if series_id:
-            try:
-                self._report_watch_progress_to_coins(series_id, 0, 100)
-            except Exception:
-                pass
         candidates = []
         if task_id:
             candidates.extend([
                 ("POST", f"/coins/tasks/{task_id}/claim", None),
                 ("POST", "/coins/tasks/claim", {"task_id": task_id, "campaign": False}),
-                ("POST", f"/coins/tasks/{task_id}/reward", None),
-                ("POST", f"/coins/tasks/{task_id}/complete", {}),
-                ("POST", "/coins/tasks/complete", {"task_id": task_id, "campaign": False}),
             ])
         if series_id:
             candidates.extend([
                 ("POST", "/watch-ladder/claim", {"series_id": series_id, "campaign": False}),
                 ("POST", f"/coins/watch-ladder/{series_id}/claim", None),
-                ("POST", "/coins/claim", {"series_id": series_id, "type": "watch_ladder", "campaign": False}),
-                ("POST", "/coins/redeem", {"series_id": series_id, "task": "watch_ladder", "campaign": False}),
-                ("POST", f"/watch-ladder/{series_id}/complete", {"campaign": False}),
             ])
-        any_ok = False
         for entry in candidates:
             method, path = entry[0], entry[1]
             body = entry[2] if len(entry) > 2 else None
@@ -643,20 +598,13 @@ class MiniPixV2:
                     headers={"content-type": "application/json; charset=utf-8"},
                     data=json.dumps(body, ensure_ascii=False).encode("utf-8") if body else None,
                 )
-                if sc and sc < 500 and isinstance(data, dict):
-                    if data.get("success") is True:
-                        any_ok = True
-                        break
-                    if sc == 200 and "success" not in data:
-                        continue
+                if sc and sc < 500 and isinstance(data, dict) and data.get("success") is True:
+                    return True
             except Exception:
                 continue
-        return any_ok
+        return False
 
-    def watch_episode(
-        self, episode, series_info, delay_multiplier=0.0,
-        min_watch_pct=80, allow_repeat=False, nth_watch=None,
-    ):
+    def watch_episode(self, episode, series_info, allow_repeat=False, nth_watch=None):
         if not isinstance(series_info, dict) or not isinstance(episode, dict):
             return False, "invalid"
         series_id = series_info.get("_id") or series_info.get("id") or series_info.get("series_id")
@@ -666,6 +614,7 @@ class MiniPixV2:
         series_title = series_info.get("title") or ""
         hindi_title = series_info.get("hindiTitle") or series_title
         detail_image = series_info.get("cardImage") or series_info.get("longVerticalImage") or ""
+
         try:
             tc_in = int(episode.get("tcIn") or 0)
         except Exception:
@@ -678,61 +627,41 @@ class MiniPixV2:
             tc_out = tc_in + 60
         tc_in_ms = tc_in * 1000
         tc_out_ms = tc_out * 1000
+
         history_key = (series_id, ep_no)
         current_pct = int(self.watch_history.get(history_key, {}).get("watchedPct", 0) or 0)
-        if not allow_repeat and current_pct >= min_watch_pct:
+        if not allow_repeat and current_pct >= 80:
             return True, "skip"
 
-        progress_steps = [1, 50, 80, 99, 100, 100]
-        any_fail = False
-        reported_coin_progress = False
-        for pct in progress_steps:
-            if not allow_repeat and pct < current_pct:
-                continue
-            ok = self._update_watch_progress(
+        for pct in [1, 50, 80, 99, 100]:
+            self._update_watch_progress(
                 series_id, series_title, hindi_title, ep_no,
                 tc_in_ms, tc_out_ms, detail_image, pct,
             )
-            if not ok:
-                any_fail = True
-            if pct >= 80 and not reported_coin_progress:
-                try:
-                    self._report_watch_progress_to_coins(series_id, ep_no, pct, series_title)
-                    reported_coin_progress = True
-                except Exception:
-                    pass
+            if pct >= 80:
+                self._report_watch_progress_to_coins(series_id, ep_no, pct, series_title)
             time.sleep(0.12)
-        if not reported_coin_progress:
-            try:
-                self._report_watch_progress_to_coins(series_id, ep_no, 100, series_title)
-            except Exception:
-                pass
+
         try:
-            self.claim_reward_task(series_id=series_id, task_id=None)
+            self.claim_reward_task(series_id=series_id)
         except Exception:
             pass
-        time.sleep(0.4)
+
         self.watch_history[history_key] = {"watchedPct": 100, "time": tc_out_ms}
         rk = (str(series_id), str(ep_no))
         self.runtime_watch_counts[rk] = self.runtime_watch_counts.get(rk, 0) + 1
-        self.watch_history_raw.append({
-            "id": series_id, "series_id": series_id,
-            "episodeNo": ep_no, "episode_no": ep_no,
-            "watchedPct": 100, "progress": 100, "time": tc_out_ms,
-        })
         return True, "done"
 
-    def browse_and_watch_all_smart_repeat(self, progress_callback=None, max_watches=300):
-        """Returns summary dict. progress_callback(msg) is optional for Telegram updates."""
+    def browse_and_watch_all_smart_repeat(self, progress_callback=None, max_watches=250):
         def log(msg):
             if progress_callback:
                 progress_callback(msg)
 
-        log("Checking campaign status...")
-        cap_status = self.get_campaign_status()
-        log(f"Campaign: {'ON' if cap_status['enabled'] else 'OFF'} | Cap {cap_status['used']}/{cap_status['cap']}")
+        log("Checking campaign...")
+        cap = self.get_campaign_status()
+        log(f"Campaign: {'ON' if cap['enabled'] else 'OFF'} | {cap['used']}/{cap['cap']}")
 
-        log("Fetching all series...")
+        log("Fetching series list...")
         all_series = self.get_all_series()
         if not all_series:
             return {"error": "No series found"}
@@ -742,20 +671,24 @@ class MiniPixV2:
         except Exception:
             pass
         watch_counts = self.get_watch_counts_from_profile()
-        total_watched_all = 0
+
+        total_watched = 0
         total_skipped = 0
         total_failed = 0
         balance_before = self.get_balance_silent()
 
         for si, s in enumerate(all_series, 1):
+            if total_watched >= max_watches:
+                log("Soft limit reached.")
+                break
             sid = s.get("_id") or s.get("id") or s.get("series_id")
             if not sid:
                 continue
-            series_title = s.get("title") or "?"
+            title = s.get("title") or "?"
             episodes, _ = self.get_episodes(sid, page=1, page_size=500)
             if not episodes:
                 continue
-            episodes_sorted = sorted(
+            episodes = sorted(
                 episodes,
                 key=lambda e: int(e.get("episodeNo") or 0) if str(e.get("episodeNo") or "").isdigit() else 0,
             )
@@ -764,40 +697,38 @@ class MiniPixV2:
             except Exception:
                 pass
 
-            log(f"[{si}/{len(all_series)}] {series_title} ({len(episodes_sorted)} eps)")
-            done_this = 0
-            for ep in episodes_sorted:
-                if total_watched_all >= max_watches:
-                    log("Soft limit reached, stopping.")
+            log(f"[{si}/{len(all_series)}] {title}")
+            done = 0
+            for ep in episodes:
+                if total_watched >= max_watches:
                     break
                 ep_no = ep.get("episodeNo")
                 kp = (str(sid), str(ep_no))
                 cnt = watch_counts.get(kp, 0) + self.runtime_watch_counts.get(kp, 0)
                 if cnt >= MAX_WATCHES_PER_EP:
                     continue
-                nth = cnt + 1
-                ok, st = self.watch_episode(
-                    ep, s, delay_multiplier=0.0,
-                    min_watch_pct=80, allow_repeat=True, nth_watch=nth,
-                )
+                ok, st = self.watch_episode(ep, s, allow_repeat=True, nth_watch=cnt + 1)
                 if st == "skip":
                     total_skipped += 1
                 elif ok:
-                    done_this += 1
-                    total_watched_all += 1
+                    done += 1
+                    total_watched += 1
                 else:
                     total_failed += 1
             try:
                 self.claim_reward_task(series_id=sid)
             except Exception:
                 pass
-            if done_this:
-                log(f"  → {done_this} watches done for this series")
+            if done:
+                log(f"  → {done} watches")
 
         bal_end = self.get_balance_silent()
-        delta = (bal_end or 0) - (balance_before or 0) if bal_end is not None and balance_before is not None else None
+        delta = None
+        if balance_before is not None and bal_end is not None:
+            delta = bal_end - balance_before
+
         return {
-            "watched": total_watched_all,
+            "watched": total_watched,
             "skipped": total_skipped,
             "failed": total_failed,
             "balance_before": balance_before,
@@ -866,13 +797,13 @@ class MiniPixV2:
     def _build_quiz_prompt(self, question, options):
         prompt = (
             "Solve this multiple-choice question. "
-            "Return ONLY the integer index of the correct option (0, 1, 2, ...). "
-            "No explanation, no extra words, just a single digit integer.\n\n"
-            f"Question (both Hindi and English provided):\n{question}\n\nOptions:\n"
+            "Return ONLY the integer index of the correct option (0, 1, 2...). "
+            "No explanation, just the number.\n\n"
+            f"Question:\n{question}\n\nOptions:\n"
         )
         for i, opt in enumerate(options):
-            prompt += f"  {i}: {opt}\n"
-        prompt += "\nCorrect option index (integer only): "
+            prompt += f"{i}: {opt}\n"
+        prompt += "\nCorrect option index:"
         return prompt
 
     def _parse_quiz_answer(self, answer_text, options):
@@ -884,61 +815,51 @@ class MiniPixV2:
             idx = int(m.group(1))
             if 0 <= idx < len(options):
                 return idx
-        for i, opt in enumerate(options):
-            opt_clean = str(opt).strip().lower()
-            if opt_clean and opt_clean in t.lower():
-                return i
-        m2 = re.search(r"option\s*(\d+)", t, flags=re.IGNORECASE)
-        if m2:
-            idx = int(m2.group(1))
-            if 1 <= idx <= len(options):
-                return idx - 1
         return None
 
-    def ask_groq(self, question, options):
-        if not GROQ_API_KEY:
+    def ask_groq(self, question, options, telegram_user_id: int = None):
+        api_key = get_user_groq_key(telegram_user_id) if telegram_user_id else GLOBAL_GROQ_API_KEY
+        if not api_key:
             return None
+
         prompt = self._build_quiz_prompt(question, options)
         try:
             from groq import Groq
-            client = Groq(api_key=GROQ_API_KEY)
+            client = Groq(api_key=api_key)
             completion = client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_completion_tokens=64,
-                top_p=1,
-                stream=False,
+                temperature=0.1,
+                max_tokens=20,
             )
             answer_text = (completion.choices[0].message.content or "").strip()
             return self._parse_quiz_answer(answer_text, options)
         except Exception as e:
             logger.warning(f"Groq error: {e}")
-            # fallback HTTP
+            # HTTP fallback
             try:
-                url = "https://api.groq.com/openai/v1/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                }
-                payload = {
-                    "model": GROQ_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.2,
-                    "max_completion_tokens": 64,
-                }
-                r = requests.post(url, json=payload, headers=headers, timeout=40)
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": GROQ_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.1,
+                        "max_tokens": 20,
+                    },
+                    timeout=40,
+                )
                 if r.status_code == 200:
-                    data = r.json()
-                    answer_text = data["choices"][0]["message"]["content"].strip()
+                    answer_text = r.json()["choices"][0]["message"]["content"].strip()
                     return self._parse_quiz_answer(answer_text, options)
             except Exception:
                 pass
             return None
 
-    def run_quiz_auto(self, max_sessions=3, question_delay=None, progress_callback=None):
-        delay = question_delay if question_delay is not None else QUIZ_QUESTION_DELAY
-
+    def run_quiz_auto(self, max_sessions=3, question_delay=8, progress_callback=None, telegram_user_id=None):
         def log(msg):
             if progress_callback:
                 progress_callback(msg)
@@ -950,20 +871,20 @@ class MiniPixV2:
         if daily.get("exhausted"):
             return {"error": "Daily quiz attempts exhausted"}
 
-        total_coins_run = 0
+        total_coins = 0
         sessions_done = 0
 
         for session_num in range(1, max_sessions + 1):
-            log(f"--- Quiz Session {session_num}/{max_sessions} ---")
+            log(f"--- Session {session_num}/{max_sessions} ---")
             session_id, question_obj, session_meta = self.quiz_start_session()
             if not session_id or not question_obj:
-                log("Session start failed")
+                log("Failed to start session")
                 break
 
-            session_coins = 0
-            q_count = 0
             hearts = session_meta.get("hearts", 3) if session_meta else 3
             ad_every = session_meta.get("adGateEvery", 5) if session_meta else 5
+            q_count = 0
+            session_coins = 0
 
             while True:
                 if hearts <= 0:
@@ -980,26 +901,26 @@ class MiniPixV2:
                 q_total = question_obj.get("total", "?")
 
                 q_count += 1
-                combined_q = q_text_hi
+                combined = q_text_hi
                 if q_text_en and q_text_en != q_text_hi:
-                    combined_q = f"{q_text_hi}\n[English: {q_text_en}]" if q_text_hi else q_text_en
+                    combined = f"{q_text_hi}\n[EN: {q_text_en}]" if q_text_hi else q_text_en
 
-                log(f"Q{q_idx + 1}/{q_total}: {q_text_hi or q_text_en}")
+                log(f"Q{q_idx+1}/{q_total}: {(q_text_hi or q_text_en)[:80]}")
 
-                if not q_id or not isinstance(options, list) or len(options) < 2:
+                if not q_id or len(options) < 2:
                     break
 
-                correct_index = self.ask_groq(combined_q, options)
+                correct_index = self.ask_groq(combined, options, telegram_user_id=telegram_user_id)
                 if correct_index is None:
-                    rl = self.quiz_use_lifeline(session_id, q_id)
-                    removed_set = set(rl or [])
-                    remaining = [i for i in range(len(options)) if i not in removed_set]
+                    # try lifeline then guess
+                    removed = self.quiz_use_lifeline(session_id, q_id) or []
+                    remaining = [i for i in range(len(options)) if i not in set(removed)]
                     correct_index = remaining[0] if remaining else 0
 
                 correct_index = max(0, min(correct_index, len(options) - 1))
-                log(f"  → Chose [{correct_index}] {options[correct_index]}")
+                log(f"  → [{correct_index}] {options[correct_index][:40]}")
 
-                time.sleep(delay)
+                time.sleep(question_delay)
 
                 result = self.quiz_submit_answer(session_id, q_id, correct_index)
                 if not result:
@@ -1008,16 +929,15 @@ class MiniPixV2:
                 if result.get("success"):
                     correct_flag = result.get("correct", False)
                     coins_earned = int(result.get("coinsEarned") or 0)
-                    coins_so_far = result.get("coinsSoFar", 0)
+                    session_coins = result.get("coinsSoFar", 0)
                     hearts = int(result.get("hearts", hearts))
-                    session_coins = coins_so_far
-                    total_coins_run += coins_earned
-                    status_txt = "✅ CORRECT" if correct_flag else "❌ WRONG"
-                    log(f"  {status_txt} | +{coins_earned} | hearts={hearts}")
+                    total_coins += coins_earned
+                    status_txt = "✅" if correct_flag else "❌"
+                    log(f"  {status_txt} +{coins_earned} | hearts={hearts}")
 
                     next_info = result.get("next")
                     if not next_info:
-                        log(f"Session complete! Coins: {coins_so_far}")
+                        log(f"Session complete • {session_coins} coins")
                         break
 
                     if isinstance(next_info, dict):
@@ -1026,9 +946,6 @@ class MiniPixV2:
                             session_id = result.get("sessionId") or session_id
                             continue
                         if "result" in next_info:
-                            rinfo = next_info["result"]
-                            if isinstance(rinfo, dict):
-                                log(f"Level result: {rinfo.get('scorePct')}% | Coins: {rinfo.get('coins')}")
                             break
 
                     if q_count > 0 and ad_every > 0 and (q_count % ad_every == 0):
@@ -1042,18 +959,17 @@ class MiniPixV2:
                     break
 
             sessions_done += 1
-            log(f"Session {session_num} coins: {session_coins}")
             if session_num < max_sessions:
                 time.sleep(2)
 
         return {
             "sessions": sessions_done,
-            "total_coins": total_coins_run,
+            "total_coins": total_coins,
             "balance": self.get_balance(),
         }
 
 
-# ───────────────────── Per-user bot state ─────────────────────
+# ───────────────────── Per-user bot instances ─────────────────────
 user_bots: Dict[int, MiniPixV2] = {}
 
 
@@ -1069,7 +985,8 @@ def main_menu_keyboard():
             [KeyboardButton("💰 Balance"), KeyboardButton("📊 Campaign")],
             [KeyboardButton("👥 Accounts"), KeyboardButton("➕ Login")],
             [KeyboardButton("🎬 Watch All (4x)"), KeyboardButton("🧠 Quiz Status")],
-            [KeyboardButton("🤖 Run Quiz"), KeyboardButton("ℹ️ Help")],
+            [KeyboardButton("🤖 Run Quiz"), KeyboardButton("🔑 Set Groq Key")],
+            [KeyboardButton("ℹ️ Help")],
         ],
         resize_keyboard=True,
     )
@@ -1082,31 +999,68 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"👋 Hi {user.first_name}!\n\n"
         "MiniPix V2 Bot ready.\n\n"
-        "Use the buttons or commands:\n"
-        "/balance  /campaign  /accounts\n"
-        "/login  /watch  /quiz  /help"
+        "• /setgroq – apna Groq API key set karo (quiz ke liye)\n"
+        "• /login – account login\n"
+        "• /watch – 4x watch\n"
+        "• /quiz – quiz status\n"
     )
     if bot.access_token:
-        text += f"\n\n✅ Logged in as: {bot.current_account_label or bot.phone}"
+        text += f"\n✅ Logged in: {bot.current_account_label or bot.phone}"
     else:
-        text += "\n\n⚠️ Not logged in. Use /login"
+        text += "\n⚠️ Not logged in → /login"
     await update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 Commands\n\n"
+        "📖 *Commands*\n\n"
         "/start – main menu\n"
         "/balance – coin balance\n"
-        "/campaign – watch campaign status\n"
-        "/accounts – list / switch / remove accounts\n"
+        "/campaign – watch campaign\n"
+        "/accounts – list / switch accounts\n"
         "/login – OTP or Token login\n"
-        "/watch – smart 4x watch all series\n"
-        "/quiz – quiz status + auto solver\n"
-        "/logout – logout current account\n\n"
-        "⚠️ Set GROQ_API_KEY env var for quiz solver.",
+        "/watch – smart 4x watch\n"
+        "/quiz – quiz status\n"
+        "/setgroq `gsk_xxx` – apna Groq key set karo\n"
+        "/mygroq – check if key is set\n"
+        "/logout – logout\n\n"
+        "Groq key free lo: https://console.groq.com/keys",
+        parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
+
+
+async def set_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n`/setgroq gsk_your_key_here`\n\n"
+            "Free key yahan se banao:\nhttps://console.groq.com/keys",
+            parse_mode="Markdown",
+        )
+        return
+
+    key = context.args[0].strip()
+    if not key.startswith("gsk_"):
+        await update.message.reply_text("❌ Invalid key. Groq key `gsk_` se start hota hai.")
+        return
+
+    user_id = str(update.effective_user.id)
+    user_groq_keys[user_id] = key
+    save_user_groq_keys(user_groq_keys)
+    await update.message.reply_text("✅ Aapka Groq API key save ho gaya!\nAb quiz use kar sakte ho.")
+
+
+async def my_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key = get_user_groq_key(update.effective_user.id)
+    if key:
+        masked = key[:8] + "..." + key[-4:]
+        await update.message.reply_text(f"✅ Key set hai: `{masked}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(
+            "❌ Koi Groq key set nahi hai.\n\n"
+            "Set karne ke liye:\n`/setgroq gsk_xxxxxxxx`",
+            parse_mode="Markdown",
+        )
 
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1124,14 +1078,13 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def campaign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
     if not bot.access_token:
-        await update.message.reply_text("Not logged in. Use /login")
+        await update.message.reply_text("Not logged in.")
         return
     st = bot.get_campaign_status()
     text = (
         f"🎥 Campaign: {'ON' if st['enabled'] else 'OFF'}\n"
         f"Daily cap: {st['used']}/{st['cap']}\n"
-        f"Reached: {st['reached']}\n"
-        f"Block watching: {st['blockWatching']}"
+        f"Reached: {st['reached']}"
     )
     await update.message.reply_text(text)
 
@@ -1152,10 +1105,7 @@ async def accounts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton(f"Switch → {lbl}", callback_data=f"sw:{lbl}"),
             InlineKeyboardButton("❌", callback_data=f"rm:{lbl}"),
         ])
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1175,32 +1125,28 @@ async def account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("rm:"):
         label = data[3:]
         if bot.remove_account(label):
-            await query.edit_message_text(f"Removed account: {label}")
+            await query.edit_message_text(f"Removed: {label}")
         else:
             await query.edit_message_text("Remove failed")
 
 
-# ── Login conversation ──
+# ── Login ──
 async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📱 Phone + OTP", callback_data="login:otp")],
         [InlineKeyboardButton("🔑 Bearer Token", callback_data="login:token")],
     ]
-    await update.message.reply_text(
-        "Choose login method:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return ConversationHandler.END  # we use callback instead
+    await update.message.reply_text("Choose login method:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def login_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "login:otp":
-        await query.edit_message_text("Send phone number (e.g. +9198xxxxxxxx or 98xxxxxxxx):")
+        await query.edit_message_text("Phone number bhejo (+91... ya 98...):")
         return WAIT_PHONE
     elif query.data == "login:token":
-        await query.edit_message_text("Send the Bearer token:")
+        await query.edit_message_text("Bearer token bhejo:")
         return WAIT_TOKEN
     return ConversationHandler.END
 
@@ -1213,10 +1159,10 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
     st = bot.login_otp_generate(phone)
     if not st:
-        await update.message.reply_text("Failed to send OTP. Try again.")
+        await update.message.reply_text("OTP bhejne me fail. Dobara try karo.")
         return ConversationHandler.END
     context.user_data["session_token"] = st
-    await update.message.reply_text(f"OTP sent to {phone}.\nNow send the OTP:")
+    await update.message.reply_text(f"OTP sent to {phone}\nAb OTP bhejo:")
     return WAIT_OTP
 
 
@@ -1225,14 +1171,14 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
     st = context.user_data.get("session_token")
     if not st:
-        await update.message.reply_text("Session lost. Start /login again.")
+        await update.message.reply_text("Session lost. /login se start karo.")
         return ConversationHandler.END
     ok = bot.login_otp_verify(st, otp)
     if ok:
         bot.open_app()
         bal = bot.get_balance()
         await update.message.reply_text(
-            f"✅ Login success!\nUser: {bot.user_id}\n💰 Balance: {bal}",
+            f"✅ Login success!\n💰 Balance: {bal}",
             reply_markup=main_menu_keyboard(),
         )
     else:
@@ -1270,19 +1216,14 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Not logged in. Use /login")
         return
 
-    msg = await update.message.reply_text("🚀 Starting smart 4x watch...\nThis can take a while.")
+    msg = await update.message.reply_text("🚀 Starting smart 4x watch...\nThoda time lagega.")
 
     def progress(text):
-        # fire-and-forget update (Telegram rate limits apply)
         try:
-            context.application.create_task(
-                msg.edit_text(f"🚀 Watching...\n\n{text[-800:]}")
-            )
+            asyncio.create_task(msg.edit_text(f"🚀 Watching...\n\n{text[-900:]}"))
         except Exception:
             pass
 
-    # run in thread to not block
-    import asyncio
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
         None,
@@ -1322,10 +1263,11 @@ async def quiz_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"🧠 Quiz Status\n\n"
         f"Level: {lvl}\n"
-        f"Qs: {cfg.get('questionsCount')} | +{cfg.get('coinsPerCorrect')}/correct | Pass {cfg.get('passPct')}%\n"
-        f"Hearts: {hearts.get('freePerLevel')}/level (cap {hearts.get('cap')})\n"
-        f"Daily: {daily.get('used')}/{daily.get('limit')} {'[EXHAUSTED]' if daily.get('exhausted') else ''}\n"
-        f"Lifetime: {totals.get('answers')} answers | {totals.get('correct')} correct | {totals.get('coins')} coins"
+        f"Qs: {cfg.get('questionsCount')} | +{cfg.get('coinsPerCorrect')}/correct\n"
+        f"Hearts: {hearts.get('freePerLevel')}/level\n"
+        f"Daily: {daily.get('used')}/{daily.get('limit')} "
+        f"{'[EXHAUSTED]' if daily.get('exhausted') else ''}\n"
+        f"Lifetime coins: {totals.get('coins')}"
     )
     await update.message.reply_text(text)
 
@@ -1335,10 +1277,18 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot.access_token:
         await update.message.reply_text("Not logged in.")
         return ConversationHandler.END
-    if not GROQ_API_KEY:
-        await update.message.reply_text("GROQ_API_KEY not set. Quiz solver disabled.")
+
+    # Check if user has Groq key
+    if not get_user_groq_key(update.effective_user.id):
+        await update.message.reply_text(
+            "❌ Pehle apna Groq API key set karo:\n\n"
+            "`/setgroq gsk_xxxxxxxx`\n\n"
+            "Free key: https://console.groq.com/keys",
+            parse_mode="Markdown",
+        )
         return ConversationHandler.END
-    await update.message.reply_text("How many quiz sessions? (1-5, default 3):")
+
+    await update.message.reply_text("Kitne quiz sessions? (1-5, default 3):")
     return WAIT_QUIZ_SESSIONS
 
 
@@ -1349,41 +1299,46 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         n = 3
     context.user_data["quiz_sessions"] = n
-    await update.message.reply_text(f"Delay between questions in seconds? (default {QUIZ_QUESTION_DELAY}):")
+    await update.message.reply_text(f"Har question ke beech delay (seconds)? (default {QUIZ_QUESTION_DELAY}):")
     return WAIT_QUIZ_DELAY
 
 
 async def quiz_delay_and_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         delay = int(update.message.text.strip() or str(QUIZ_QUESTION_DELAY))
-        delay = max(3, min(30, delay))
+        delay = max(3, min(25, delay))
     except Exception:
         delay = QUIZ_QUESTION_DELAY
 
     bot = get_bot(update.effective_user.id)
     sessions = context.user_data.get("quiz_sessions", 3)
-    msg = await update.message.reply_text(f"🤖 Running {sessions} quiz sessions (delay {delay}s)...")
+    telegram_uid = update.effective_user.id
+
+    msg = await update.message.reply_text(f"🤖 Running {sessions} sessions (delay {delay}s)...")
 
     def progress(text):
         try:
-            context.application.create_task(
-                msg.edit_text(f"🤖 Quiz running...\n\n{text[-900:]}")
-            )
+            asyncio.create_task(msg.edit_text(f"🤖 Quiz running...\n\n{text[-900:]}"))
         except Exception:
             pass
 
-    import asyncio
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
         None,
-        lambda: bot.run_quiz_auto(max_sessions=sessions, question_delay=delay, progress_callback=progress),
+        lambda: bot.run_quiz_auto(
+            max_sessions=sessions,
+            question_delay=delay,
+            progress_callback=progress,
+            telegram_user_id=telegram_uid,
+        ),
     )
 
     if "error" in result:
         await msg.edit_text(f"❌ {result['error']}")
     else:
         await msg.edit_text(
-            f"🏁 Quiz done\nSessions: {result.get('sessions')}\n"
+            f"🏁 Quiz done\n"
+            f"Sessions: {result.get('sessions')}\n"
             f"Coins this run: ~{result.get('total_coins')}\n"
             f"Current balance: {result.get('balance')}"
         )
@@ -1392,11 +1347,11 @@ async def quiz_delay_and_run(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
-    bot.logout_current() if hasattr(bot, "logout_current") else bot._reset_state()
+    bot._reset_state()
     await update.message.reply_text("Logged out.", reply_markup=main_menu_keyboard())
 
 
-# text button router
+# Text button router
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text == "💰 Balance":
@@ -1413,18 +1368,22 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await quiz_status_cmd(update, context)
     elif text == "🤖 Run Quiz":
         return await quiz_run_start(update, context)
+    elif text == "🔑 Set Groq Key":
+        await update.message.reply_text(
+            "Apna Groq key bhejo:\n`/setgroq gsk_xxxxxxxx`\n\n"
+            "Free key: https://console.groq.com/keys",
+            parse_mode="Markdown",
+        )
     elif text == "ℹ️ Help":
         await help_cmd(update, context)
     else:
-        await update.message.reply_text("Unknown. Use /help or the buttons.")
+        await update.message.reply_text("Unknown. Use /help")
 
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
         print("ERROR: Set TELEGRAM_BOT_TOKEN environment variable")
         return
-    if not GROQ_API_KEY:
-        print("WARNING: GROQ_API_KEY not set – quiz solver will not work")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -1462,6 +1421,8 @@ def main():
     app.add_handler(CommandHandler("login", login_start))
     app.add_handler(CommandHandler("watch", watch_cmd))
     app.add_handler(CommandHandler("quiz", quiz_status_cmd))
+    app.add_handler(CommandHandler("setgroq", set_groq))
+    app.add_handler(CommandHandler("mygroq", my_groq))
     app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CallbackQueryHandler(account_callback, pattern=r"^(sw|rm):"))
     app.add_handler(login_conv)
