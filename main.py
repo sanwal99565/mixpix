@@ -2,10 +2,10 @@
 """
 MiniPix V2 Telegram Bot
 - Per-user Groq API key
-- Uses openai/gpt-oss-120b as primary model, others as fallback
+- Primary model: openai/gpt-oss-120b
 - Lock file to avoid multiple instances
 - Quiz sessions 10–25 (default 15), 10s delay
-- Detailed quiz debug (question, options, model answer, result)
+- Handles stale sessions (hearts=0) by ending them
 """
 
 import os
@@ -51,7 +51,6 @@ GLOBAL_GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
 
-# Primary model + fallbacks
 GROQ_MODELS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
@@ -786,12 +785,25 @@ class MiniPixV2:
             "delta": delta,
         }
 
-    # ── QUIZ (improved) ──
+    # ── QUIZ ──
     def get_quiz_status(self):
         sc, data = self._req("GET", "/quiz/status")
         if sc == 200 and isinstance(data, dict) and data.get("success"):
             return data
         return None
+
+    def quiz_end_session(self, session_id):
+        """End an active quiz session."""
+        sc, data = self._req(
+            "POST", f"/quiz/session/{session_id}/end",
+            headers={"content-type": "application/json; charset=utf-8"},
+            data=json.dumps({}).encode("utf-8"),
+        )
+        if sc == 200 and isinstance(data, dict) and data.get("success"):
+            send_log_sync(f"✅ Ended old quiz session {session_id}")
+            return True
+        send_log_sync(f"⚠️ Failed to end session {session_id}: {sc} {str(data)[:200]}")
+        return False
 
     def quiz_start_session(self):
         sc, data = self._req(
@@ -799,19 +811,16 @@ class MiniPixV2:
             headers={"content-type": "application/json; charset=utf-8"},
             data=json.dumps({}).encode("utf-8"),
         )
-        # Log full response for debugging
         send_log_sync(
             f"📡 quiz/session/start response:\n"
             f"Status: {sc}\n"
             f"Data: {json.dumps(data, ensure_ascii=False)[:500]}"
         )
         if sc == 200 and isinstance(data, dict):
-            # Some APIs wrap success in 'success' or 'status'
             if data.get("success") is True or data.get("status") == "success":
                 session_obj = data.get("session") or {}
                 question_obj = data.get("question")
                 sid = session_obj.get("sessionId") or data.get("sessionId") or data.get("_id")
-                # If question_obj is missing, try to get it from 'data' or 'next'
                 if not question_obj:
                     question_obj = data.get("data", {}).get("question") or data.get("next", {}).get("question")
                 if sid and question_obj:
@@ -887,12 +896,10 @@ class MiniPixV2:
             idx = int(m.group(1))
             if 0 <= idx < len(options):
                 return idx
-        # fallback: if answer contains option text
         for i, opt in enumerate(options):
             opt_clean = str(opt).strip().lower()
             if opt_clean and opt_clean in t.lower():
                 return i
-        # try "option X"
         m2 = re.search(r"option\s*(\d+)", t, flags=re.IGNORECASE)
         if m2:
             idx = int(m2.group(1))
@@ -908,7 +915,6 @@ class MiniPixV2:
 
         prompt = self._build_quiz_prompt(question, options)
 
-        # Try each model, including primary first
         for model in GROQ_MODELS:
             try:
                 from groq import Groq
@@ -934,13 +940,8 @@ class MiniPixV2:
 
                 answer_text = (completion.choices[0].message.content or "").strip()
                 idx = self._parse_quiz_answer(answer_text, options)
-
                 if idx is not None:
                     return idx, model, answer_text
-                else:
-                    # If parse fails, try one more time without system prompt?
-                    continue
-
             except Exception as e:
                 err = str(e).lower()
                 if "rate" in err or "limit" in err or "quota" in err or "429" in err:
@@ -949,7 +950,7 @@ class MiniPixV2:
                 logger.warning(f"Model {model} failed: {e}")
                 continue
 
-        # HTTP fallback (primary model)
+        # HTTP fallback
         try:
             r = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -958,7 +959,7 @@ class MiniPixV2:
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": GROQ_MODELS[0],  # primary
+                    "model": GROQ_MODELS[0],
                     "messages": [
                         {
                             "role": "system",
@@ -992,12 +993,10 @@ class MiniPixV2:
             if progress_callback:
                 progress_callback(msg)
 
-        # Ensure user is fetched and token is valid
         if not self.user_id:
             if not self.get_user():
                 return {"error": "User not authenticated. Re-login required."}
 
-        # Check daily limit
         status = self.get_quiz_status()
         if not status:
             return {"error": "Could not fetch quiz status"}
@@ -1015,8 +1014,9 @@ class MiniPixV2:
 
         for session_num in range(1, max_sessions + 1):
             log(f"--- Session {session_num}/{max_sessions} ---")
+
+            # Attempt to start a session (with retry)
             session_id, question_obj, session_meta = None, None, None
-            # Try up to 2 times
             for attempt in range(2):
                 session_id, question_obj, session_meta = self.quiz_start_session()
                 if session_id and question_obj:
@@ -1024,12 +1024,25 @@ class MiniPixV2:
                 if attempt == 0:
                     log("⚠️ Session start failed, retrying in 3s...")
                     time.sleep(3)
+
             if not session_id or not question_obj:
                 log("❌ Failed to start session after retry")
                 send_log_sync(f"❌ Session start failed | User <code>{telegram_user_id}</code>")
                 break
 
+            # Check if session has 0 hearts – it's dead, end it and restart
             hearts = session_meta.get("hearts", 3) if session_meta else 3
+            if hearts == 0:
+                log("💔 Existing session has 0 hearts. Ending it to start fresh...")
+                self.quiz_end_session(session_id)
+                time.sleep(1)
+                # Retry start
+                session_id, question_obj, session_meta = self.quiz_start_session()
+                if not session_id or not question_obj:
+                    log("❌ Failed to start new session after ending old one")
+                    break
+                hearts = session_meta.get("hearts", 3) if session_meta else 3
+
             ad_every = session_meta.get("adGateEvery", 5) if session_meta else 5
             q_count = 0
             session_coins = 0
@@ -1055,13 +1068,10 @@ class MiniPixV2:
                 if q_text_en and q_text_en != q_text_hi:
                     combined = f"{q_text_hi}\n[EN: {q_text_en}]" if q_text_hi else q_text_en
 
-                short_q = (q_text_hi or q_text_en)[:120]
-
                 if not q_id or len(options) < 2:
                     send_log_sync(f"⚠️ Invalid question: q_id={q_id}, options={len(options)}")
                     break
 
-                # Ask Groq
                 correct_index, model_used, raw_answer = self.ask_groq(
                     combined, options, telegram_user_id=telegram_user_id
                 )
@@ -1093,7 +1103,6 @@ class MiniPixV2:
                     else:
                         wrong_count += 1
 
-                    # Build debug line
                     status_emoji = "✅" if correct_flag else "❌"
                     correct_idx_server = result.get("correctIndex")
                     correct_server_text = ""
