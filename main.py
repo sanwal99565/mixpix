@@ -6,6 +6,7 @@ MiniPix V2 Telegram Bot
 - Lock file to avoid multiple instances
 - Quiz sessions 10–25 (default 15), 10s delay
 - Handles stale sessions (hearts=0) by retrying and aborting after 2 failures
+- Improved OTP login with detailed error logging
 """
 
 import os
@@ -259,10 +260,20 @@ class MiniPixV2:
             headers={"content-type": "application/json; charset=utf-8"},
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
-        if sc == 200 and isinstance(data, dict) and (
-            data.get("message") == "OTP sent" or data.get("success")
-        ):
-            return data.get("session_token") or data.get("sessionToken")
+        # Log full response for debugging
+        send_log_sync(
+            f"📡 OTP generate response:\n"
+            f"Status: {sc}\n"
+            f"Data: {json.dumps(data, ensure_ascii=False)[:500]}"
+        )
+        if sc == 200 and isinstance(data, dict):
+            if data.get("message") == "OTP sent" or data.get("success"):
+                return data.get("session_token") or data.get("sessionToken")
+            else:
+                error_msg = data.get("message") or data.get("error") or "Unknown error"
+                send_log_sync(f"❌ OTP generation failed: {error_msg}")
+        else:
+            send_log_sync(f"❌ OTP generation HTTP {sc}: {str(data)[:200]}")
         return None
 
     def login_otp_verify(self, session_token, otp, save_label=None):
@@ -286,6 +297,7 @@ class MiniPixV2:
             self.get_user()
             self._store_current_account(save_label)
             return True
+        send_log_sync(f"❌ OTP verify failed: {sc} {json.dumps(data, ensure_ascii=False)[:300]}")
         return False
 
     def login_with_token(self, token, user_id=None, profile_id=None, label=None):
@@ -1020,7 +1032,6 @@ class MiniPixV2:
                 if failed_attempts >= 2:
                     log("Aborting: too many failed attempts to start session.")
                     break
-                # Wait a bit and continue to next session
                 time.sleep(3)
                 continue
 
@@ -1033,7 +1044,6 @@ class MiniPixV2:
                 if failed_attempts >= 2:
                     log("Aborting: repeated dead sessions.")
                     break
-                # Wait and try next session
                 time.sleep(5)
                 continue
 
@@ -1364,14 +1374,25 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     if not phone.startswith("+"):
         phone = "+91" + phone.lstrip("0")
+    # Basic validation
+    if not re.match(r"^\+[1-9]\d{1,14}$", phone):
+        await update.message.reply_text("❌ Invalid phone number. Use format: +91XXXXXXXXXX")
+        return WAIT_PHONE
+
     context.user_data["phone"] = phone
     bot = get_bot(update.effective_user.id)
     st = bot.login_otp_generate(phone)
     if not st:
-        await update.message.reply_text("OTP bhejne me fail.")
+        await update.message.reply_text(
+            "❌ OTP bhejne me fail. Check:\n"
+            "• Phone number is correct\n"
+            "• Internet connection\n"
+            "• Server is reachable\n\n"
+            "Try again with /login"
+        )
         return ConversationHandler.END
     context.user_data["session_token"] = st
-    await update.message.reply_text(f"OTP sent to {phone}\nAb OTP bhejo:")
+    await update.message.reply_text(f"✅ OTP sent to {phone}\nAb OTP bhejo:")
     return WAIT_OTP
 
 
@@ -1392,7 +1413,7 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         send_log_sync(f"✅ Login success | User <code>{update.effective_user.id}</code> | Balance: {bal}")
     else:
-        await update.message.reply_text("❌ OTP verify failed.")
+        await update.message.reply_text("❌ OTP verify failed. Check OTP and try again.")
     return ConversationHandler.END
 
 
