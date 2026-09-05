@@ -2,8 +2,8 @@
 """
 MiniPix V2 Telegram Bot
 - Per-user Groq API key
-- Multi-model support (openai/gpt-oss-120b first)
-- Log Channel for quiz + watch
+- Only available models
+- Detailed quiz debug logs
 """
 
 import os
@@ -12,9 +12,8 @@ import time
 import re
 import logging
 import asyncio
-import threading
 from datetime import date
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 
 import requests
 from telegram import (
@@ -45,16 +44,15 @@ QUIZ_QUESTION_DELAY = 8
 
 GLOBAL_GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")  # e.g. -100xxxxxxxxxx
+LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
 
-# Models in priority order
+# Only models available on your account
 GROQ_MODELS = [
     "openai/gpt-oss-120b",
-    "meta-llama/llama-prompt-guard-2-86m",
-    "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+    "qwen/qwen3.6-27b",
+    "allam-2-7b",
 ]
 
 HEADERS_BASE = {
@@ -68,13 +66,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Conversation states
 (WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS, WAIT_QUIZ_DELAY) = range(5)
 
 
-# ───────────────────── Log Channel Helper ─────────────────────
+# ───────────────────── Log Channel ─────────────────────
 def send_log_sync(text: str):
-    """Send log to channel (works from any thread)"""
     if not LOG_CHANNEL_ID or not TELEGRAM_BOT_TOKEN:
         return
     try:
@@ -82,11 +78,11 @@ def send_log_sync(text: str):
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={
                 "chat_id": LOG_CHANNEL_ID,
-                "text": text[:4000],
+                "text": text[:4090],
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
-            timeout=10,
+            timeout=12,
         )
     except Exception as e:
         logger.warning(f"Log channel error: {e}")
@@ -676,11 +672,8 @@ class MiniPixV2:
         def log(msg):
             if progress_callback:
                 progress_callback(msg)
-            # also send important logs to channel
-            if "→" in msg or "finished" in msg.lower() or "Campaign" in msg or "Fetching" in msg:
-                send_log_sync(
-                    f"<b>🎬 WATCH</b> | User <code>{telegram_user_id}</code>\n{msg}"
-                )
+            if any(x in msg for x in ["→", "finished", "Campaign", "Fetching", "Soft limit"]):
+                send_log_sync(f"<b>🎬 WATCH</b> | User <code>{telegram_user_id}</code>\n{msg}")
 
         log("Checking campaign...")
         cap = self.get_campaign_status()
@@ -756,8 +749,9 @@ class MiniPixV2:
             f"<b>🏁 WATCH FINISHED</b>\n"
             f"User: <code>{telegram_user_id}</code>\n"
             f"Watched: {total_watched} | Skipped: {total_skipped} | Failed: {total_failed}\n"
-            f"Balance: {balance_before} → {bal_end} ({delta:+d})" if delta is not None else ""
         )
+        if delta is not None:
+            summary += f"Balance: {balance_before} → {bal_end} ({delta:+d})"
         send_log_sync(summary)
 
         return {
@@ -829,14 +823,14 @@ class MiniPixV2:
 
     def _build_quiz_prompt(self, question, options):
         prompt = (
-            "Solve this multiple-choice question. "
-            "Return ONLY the integer index of the correct option (0, 1, 2...). "
-            "No explanation, just the number.\n\n"
-            f"Question:\n{question}\n\nOptions:\n"
+            "Multiple choice question. Choose the correct option.\n"
+            "Reply with ONLY the option number (0, 1, 2 or 3).\n\n"
+            f"Question:\n{question}\n\n"
+            "Options:\n"
         )
         for i, opt in enumerate(options):
-            prompt += f"{i}: {opt}\n"
-        prompt += "\nCorrect option index:"
+            prompt += f"{i}. {opt}\n"
+        prompt += "\nCorrect option number:"
         return prompt
 
     def _parse_quiz_answer(self, answer_text, options):
@@ -853,6 +847,7 @@ class MiniPixV2:
     def ask_groq(self, question, options, telegram_user_id: int = None):
         api_key = get_user_groq_key(telegram_user_id) if telegram_user_id else GLOBAL_GROQ_API_KEY
         if not api_key:
+            send_log_sync(f"❌ No Groq key for user <code>{telegram_user_id}</code>")
             return None
 
         prompt = self._build_quiz_prompt(question, options)
@@ -861,19 +856,41 @@ class MiniPixV2:
             try:
                 from groq import Groq
                 client = Groq(api_key=api_key)
+
                 completion = client.chat.completions.create(
                     model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1,
-                    max_tokens=30,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a smart quiz solver. "
+                                "Read the question and options carefully. "
+                                "Reply with ONLY a single integer number (0, 1, 2 or 3). "
+                                "Do not write any explanation or extra text."
+                            )
+                        },
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.0,
+                    max_tokens=15,
                 )
+
                 answer_text = (completion.choices[0].message.content or "").strip()
                 idx = self._parse_quiz_answer(answer_text, options)
+
+                send_log_sync(
+                    f"<b>🤖 Model:</b> <code>{model}</code>\n"
+                    f"<b>Raw Response:</b> <code>{answer_text}</code>\n"
+                    f"<b>Parsed Index:</b> <code>{idx}</code>"
+                )
+
                 if idx is not None:
-                    logger.info(f"Groq success with model: {model}")
                     return idx
+
             except Exception as e:
-                logger.warning(f"Model {model} failed: {e}")
+                err = str(e)[:300]
+                logger.warning(f"Model {model} failed: {err}")
+                send_log_sync(f"⚠️ <b>{model}</b> failed:\n<code>{err}</code>")
                 continue
 
         # HTTP fallback
@@ -885,18 +902,31 @@ class MiniPixV2:
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": GROQ_MODELS[0],
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                    "max_tokens": 30,
+                    "model": "openai/gpt-oss-120b",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Reply with ONLY one number: 0, 1, 2 or 3. Nothing else."
+                        },
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 10,
                 },
-                timeout=40,
+                timeout=45,
             )
             if r.status_code == 200:
                 answer_text = r.json()["choices"][0]["message"]["content"].strip()
-                return self._parse_quiz_answer(answer_text, options)
+                idx = self._parse_quiz_answer(answer_text, options)
+                send_log_sync(
+                    f"<b>HTTP Fallback</b>\n"
+                    f"Raw: <code>{answer_text}</code> → Index: {idx}"
+                )
+                return idx
+            else:
+                send_log_sync(f"HTTP Error {r.status_code}:\n<code>{r.text[:300]}</code>")
         except Exception as e:
-            logger.warning(f"HTTP fallback failed: {e}")
+            send_log_sync(f"HTTP fallback error: {e}")
 
         return None
 
@@ -959,7 +989,7 @@ class MiniPixV2:
                 if q_text_en and q_text_en != q_text_hi:
                     combined = f"{q_text_hi}\n[EN: {q_text_en}]" if q_text_hi else q_text_en
 
-                short_q = (q_text_hi or q_text_en)[:90]
+                short_q = (q_text_hi or q_text_en)[:120]
                 log(f"Q{q_idx+1}/{q_total}: {short_q}")
 
                 if not q_id or len(options) < 2:
@@ -970,10 +1000,10 @@ class MiniPixV2:
                     removed = self.quiz_use_lifeline(session_id, q_id) or []
                     remaining = [i for i in range(len(options)) if i not in set(removed)]
                     correct_index = remaining[0] if remaining else 0
+                    send_log_sync(f"⚠️ Model failed → using guess/lifeline index: {correct_index}")
 
                 correct_index = max(0, min(correct_index, len(options) - 1))
-                chosen_text = options[correct_index][:50]
-                log(f"  → [{correct_index}] {chosen_text}")
+                chosen_text = options[correct_index]
 
                 time.sleep(question_delay)
 
@@ -988,16 +1018,30 @@ class MiniPixV2:
                     hearts = int(result.get("hearts", hearts))
                     total_coins += coins_earned
                     status_txt = "✅ CORRECT" if correct_flag else "❌ WRONG"
+                    correct_idx_server = result.get("correctIndex")
+
+                    # ========== DETAILED DEBUG LOG ==========
+                    options_text = "\n".join([f"{i}. {opt}" for i, opt in enumerate(options)])
+                    log_msg = (
+                        f"<b>🧠 QUIZ DEBUG</b>\n"
+                        f"User: <code>{telegram_user_id}</code>\n"
+                        f"Q{q_idx+1}/{q_total}\n\n"
+                        f"<b>Question:</b>\n{(q_text_hi or q_text_en)}\n\n"
+                        f"<b>Options:</b>\n{options_text}\n\n"
+                        f"<b>Model chose:</b> [{correct_index}] {chosen_text}\n"
+                        f"<b>Result:</b> {status_txt}\n"
+                    )
+                    if not correct_flag and correct_idx_server is not None:
+                        try:
+                            server_ans = options[correct_idx_server] if correct_idx_server < len(options) else "?"
+                        except Exception:
+                            server_ans = "?"
+                        log_msg += f"<b>Correct was:</b> [{correct_idx_server}] {server_ans}\n"
+                    log_msg += f"Coins: +{coins_earned} | Hearts left: {hearts}"
+                    send_log_sync(log_msg)
+                    # ========================================
 
                     log(f"  {status_txt} +{coins_earned} | hearts={hearts}")
-
-                    # Detailed log to channel
-                    send_log_sync(
-                        f"<b>Quiz Q{q_idx+1}</b> | User <code>{telegram_user_id}</code>\n"
-                        f"{short_q}\n"
-                        f"Chosen: [{correct_index}] {chosen_text}\n"
-                        f"{status_txt} | +{coins_earned} | ❤️ {hearts}"
-                    )
 
                     next_info = result.get("next")
                     if not next_info:
@@ -1202,7 +1246,6 @@ async def account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Remove failed")
 
 
-# ── Login ──
 async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📱 Phone + OTP", callback_data="login:otp")],
@@ -1283,7 +1326,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ── Watch ──
 async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
     if not bot.access_token:
@@ -1326,7 +1368,6 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(text)
 
 
-# ── Quiz ──
 async def quiz_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
     if not bot.access_token:
@@ -1514,7 +1555,7 @@ def main():
     if LOG_CHANNEL_ID:
         print(f"Log channel enabled: {LOG_CHANNEL_ID}")
     else:
-        print("WARNING: LOG_CHANNEL_ID not set – no logs will be sent")
+        print("WARNING: LOG_CHANNEL_ID not set")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
