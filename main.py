@@ -5,7 +5,7 @@ MiniPix V2 Telegram Bot
 - Primary model: openai/gpt-oss-120b
 - Lock file to avoid multiple instances
 - Quiz sessions 10–25 (default 15), 10s delay
-- Handles stale sessions (hearts=0) by ending them
+- Handles stale sessions (hearts=0) by retrying and aborting after 2 failures
 """
 
 import os
@@ -792,19 +792,6 @@ class MiniPixV2:
             return data
         return None
 
-    def quiz_end_session(self, session_id):
-        """End an active quiz session."""
-        sc, data = self._req(
-            "POST", f"/quiz/session/{session_id}/end",
-            headers={"content-type": "application/json; charset=utf-8"},
-            data=json.dumps({}).encode("utf-8"),
-        )
-        if sc == 200 and isinstance(data, dict) and data.get("success"):
-            send_log_sync(f"✅ Ended old quiz session {session_id}")
-            return True
-        send_log_sync(f"⚠️ Failed to end session {session_id}: {sc} {str(data)[:200]}")
-        return False
-
     def quiz_start_session(self):
         sc, data = self._req(
             "POST", "/quiz/session/start",
@@ -1007,6 +994,7 @@ class MiniPixV2:
         total_coins = 0
         sessions_done = 0
         debug_lines = []
+        failed_attempts = 0
 
         send_log_sync(
             f"🧠 QUIZ STARTED | User <code>{telegram_user_id}</code> | Sessions: {max_sessions}"
@@ -1028,20 +1016,29 @@ class MiniPixV2:
             if not session_id or not question_obj:
                 log("❌ Failed to start session after retry")
                 send_log_sync(f"❌ Session start failed | User <code>{telegram_user_id}</code>")
-                break
-
-            # Check if session has 0 hearts – it's dead, end it and restart
-            hearts = session_meta.get("hearts", 3) if session_meta else 3
-            if hearts == 0:
-                log("💔 Existing session has 0 hearts. Ending it to start fresh...")
-                self.quiz_end_session(session_id)
-                time.sleep(1)
-                # Retry start
-                session_id, question_obj, session_meta = self.quiz_start_session()
-                if not session_id or not question_obj:
-                    log("❌ Failed to start new session after ending old one")
+                failed_attempts += 1
+                if failed_attempts >= 2:
+                    log("Aborting: too many failed attempts to start session.")
                     break
-                hearts = session_meta.get("hearts", 3) if session_meta else 3
+                # Wait a bit and continue to next session
+                time.sleep(3)
+                continue
+
+            hearts = session_meta.get("hearts", 3) if session_meta else 3
+
+            # If hearts == 0, this session is dead – treat as failure and retry
+            if hearts == 0:
+                log(f"💔 Session has 0 hearts – cannot continue.")
+                failed_attempts += 1
+                if failed_attempts >= 2:
+                    log("Aborting: repeated dead sessions.")
+                    break
+                # Wait and try next session
+                time.sleep(5)
+                continue
+
+            # Valid session – reset failure counter
+            failed_attempts = 0
 
             ad_every = session_meta.get("adGateEvery", 5) if session_meta else 5
             q_count = 0
