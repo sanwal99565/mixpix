@@ -3,8 +3,9 @@
 MiniPix V2 Telegram Bot
 - Per-user Groq API key
 - Only available models
-- Clean quiz output (per-session summary)
+- Detailed quiz debug logs (question, options, model answer)
 - Lock file to avoid multiple instances
+- Quiz sessions 10–25 (default 15), fixed 10s delay
 """
 
 import os
@@ -901,14 +902,11 @@ class MiniPixV2:
                 answer_text = (completion.choices[0].message.content or "").strip()
                 idx = self._parse_quiz_answer(answer_text, options)
 
-                # Log model used (briefly)
-                send_log_sync(f"🤖 Model {model} → raw: {answer_text[:20]} → idx: {idx}")
-                if idx is not None:
-                    return idx
+                # Return also the model name and raw answer for debug
+                return idx, model, answer_text
 
             except Exception as e:
                 err = str(e).lower()
-                # Skip on rate limit or quota errors
                 if "rate" in err or "limit" in err or "quota" in err or "429" in err:
                     send_log_sync(f"⏳ Model {model} rate‑limited, trying next.")
                     continue
@@ -940,14 +938,13 @@ class MiniPixV2:
             if r.status_code == 200:
                 answer_text = r.json()["choices"][0]["message"]["content"].strip()
                 idx = self._parse_quiz_answer(answer_text, options)
-                send_log_sync(f"HTTP fallback raw: {answer_text} → idx: {idx}")
-                return idx
+                return idx, "http-fallback", answer_text
             else:
                 send_log_sync(f"HTTP Error {r.status_code}: {r.text[:200]}")
         except Exception as e:
             send_log_sync(f"HTTP fallback error: {e}")
 
-        return None
+        return None, None, None
 
     def run_quiz_auto(
         self,
@@ -969,6 +966,7 @@ class MiniPixV2:
 
         total_coins = 0
         sessions_done = 0
+        debug_lines = []   # store last few debug lines for user
 
         send_log_sync(
             f"🧠 QUIZ STARTED | User <code>{telegram_user_id}</code> | Sessions: {max_sessions}"
@@ -1009,19 +1007,24 @@ class MiniPixV2:
                     combined = f"{q_text_hi}\n[EN: {q_text_en}]" if q_text_hi else q_text_en
 
                 short_q = (q_text_hi or q_text_en)[:120]
-                log(f"Q{q_idx+1}/{q_total}: {short_q}")
+                # Build debug line start
+                debug_line = f"Q{q_idx+1}/{q_total}: {short_q}"
 
                 if not q_id or len(options) < 2:
                     break
 
-                correct_index = self.ask_groq(combined, options, telegram_user_id=telegram_user_id)
+                # Ask Groq
+                correct_index, model_used, raw_answer = self.ask_groq(combined, options, telegram_user_id=telegram_user_id)
                 if correct_index is None:
                     removed = self.quiz_use_lifeline(session_id, q_id) or []
                     remaining = [i for i in range(len(options)) if i not in set(removed)]
                     correct_index = remaining[0] if remaining else 0
-                    send_log_sync(f"⚠️ Model failed → guess/lifeline index: {correct_index}")
+                    model_used = "lifeline/guess"
+                    raw_answer = "N/A"
+                    send_log_sync(f"⚠️ Model failed → using lifeline/guess index: {correct_index}")
 
                 correct_index = max(0, min(correct_index, len(options) - 1))
+                chosen_text = options[correct_index]
 
                 time.sleep(question_delay)
 
@@ -1040,11 +1043,33 @@ class MiniPixV2:
                     else:
                         wrong_count += 1
 
-                    # ✅ Clean per‑question log (only to log channel, not user)
-                    send_log_sync(
-                        f"Q{q_idx+1}/{q_total}: {'✅' if correct_flag else '❌'} "
-                        f"| coins +{coins_earned} | hearts {hearts}"
+                    # Build detailed debug line
+                    status_emoji = "✅" if correct_flag else "❌"
+                    correct_idx_server = result.get("correctIndex")
+                    correct_server_text = ""
+                    if correct_idx_server is not None:
+                        try:
+                            correct_server_text = f" (Correct: {correct_idx_server} '{options[correct_idx_server]}')"
+                        except:
+                            pass
+                    debug_line = (
+                        f"Q{q_idx+1}/{q_total}: {status_emoji} | "
+                        f"Model: {model_used} | Raw: '{raw_answer[:30]}' | "
+                        f"Chose: [{correct_index}] {chosen_text}{correct_server_text} | "
+                        f"+{coins_earned}¢ | hearts {hearts}"
                     )
+
+                    # Send to log channel
+                    send_log_sync(f"<b>{debug_line}</b>")
+
+                    # Add to local debug lines for user (keep last 15)
+                    debug_lines.append(debug_line)
+                    if len(debug_lines) > 15:
+                        debug_lines.pop(0)
+
+                    # Update user message with current debug lines
+                    user_debug = "\n".join(debug_lines)
+                    log(f"--- Quiz running ---\n{user_debug}")
 
                     next_info = result.get("next")
                     if not next_info:
@@ -1069,12 +1094,14 @@ class MiniPixV2:
                 else:
                     break
 
-            # Per‑session summary sent to user via progress callback
-            log(
+            # Per‑session summary
+            session_summary = (
                 f"🏁 Session {session_num} finished\n"
                 f"Questions: {q_count}  |  Correct: {correct_count}  |  Wrong: {wrong_count}\n"
                 f"Coins earned: {session_coins}"
             )
+            log(session_summary)
+            send_log_sync(f"<b>{session_summary}</b>")
 
             sessions_done += 1
             if session_num < max_sessions:
