@@ -786,7 +786,7 @@ class MiniPixV2:
             "delta": delta,
         }
 
-    # ── QUIZ (improved from standalone script) ──
+    # ── QUIZ (improved) ──
     def get_quiz_status(self):
         sc, data = self._req("GET", "/quiz/status")
         if sc == 200 and isinstance(data, dict) and data.get("success"):
@@ -799,12 +799,32 @@ class MiniPixV2:
             headers={"content-type": "application/json; charset=utf-8"},
             data=json.dumps({}).encode("utf-8"),
         )
-        if sc == 200 and isinstance(data, dict) and data.get("success"):
-            session_obj = data.get("session") or {}
-            question_obj = data.get("question")
-            sid = session_obj.get("sessionId") or data.get("sessionId") or data.get("_id")
-            if sid and question_obj:
-                return sid, question_obj, session_obj
+        # Log full response for debugging
+        send_log_sync(
+            f"📡 quiz/session/start response:\n"
+            f"Status: {sc}\n"
+            f"Data: {json.dumps(data, ensure_ascii=False)[:500]}"
+        )
+        if sc == 200 and isinstance(data, dict):
+            # Some APIs wrap success in 'success' or 'status'
+            if data.get("success") is True or data.get("status") == "success":
+                session_obj = data.get("session") or {}
+                question_obj = data.get("question")
+                sid = session_obj.get("sessionId") or data.get("sessionId") or data.get("_id")
+                # If question_obj is missing, try to get it from 'data' or 'next'
+                if not question_obj:
+                    question_obj = data.get("data", {}).get("question") or data.get("next", {}).get("question")
+                if sid and question_obj:
+                    return sid, question_obj, session_obj
+                else:
+                    send_log_sync(
+                        f"⚠️ Missing sessionId or question in response.\n"
+                        f"sid={sid}, question_obj={question_obj is not None}"
+                    )
+            else:
+                send_log_sync(f"❌ Quiz start returned success=False: {data.get('message', data)}")
+        else:
+            send_log_sync(f"❌ Quiz start HTTP {sc}: {str(data)[:300]}")
         return None, None, None
 
     def quiz_submit_answer(self, session_id, question_id, chosen_index):
@@ -972,6 +992,12 @@ class MiniPixV2:
             if progress_callback:
                 progress_callback(msg)
 
+        # Ensure user is fetched and token is valid
+        if not self.user_id:
+            if not self.get_user():
+                return {"error": "User not authenticated. Re-login required."}
+
+        # Check daily limit
         status = self.get_quiz_status()
         if not status:
             return {"error": "Could not fetch quiz status"}
@@ -989,9 +1015,17 @@ class MiniPixV2:
 
         for session_num in range(1, max_sessions + 1):
             log(f"--- Session {session_num}/{max_sessions} ---")
-            session_id, question_obj, session_meta = self.quiz_start_session()
+            session_id, question_obj, session_meta = None, None, None
+            # Try up to 2 times
+            for attempt in range(2):
+                session_id, question_obj, session_meta = self.quiz_start_session()
+                if session_id and question_obj:
+                    break
+                if attempt == 0:
+                    log("⚠️ Session start failed, retrying in 3s...")
+                    time.sleep(3)
             if not session_id or not question_obj:
-                log("❌ Failed to start session")
+                log("❌ Failed to start session after retry")
                 send_log_sync(f"❌ Session start failed | User <code>{telegram_user_id}</code>")
                 break
 
@@ -1024,6 +1058,7 @@ class MiniPixV2:
                 short_q = (q_text_hi or q_text_en)[:120]
 
                 if not q_id or len(options) < 2:
+                    send_log_sync(f"⚠️ Invalid question: q_id={q_id}, options={len(options)}")
                     break
 
                 # Ask Groq
@@ -1058,7 +1093,7 @@ class MiniPixV2:
                     else:
                         wrong_count += 1
 
-                    # Build detailed debug line
+                    # Build debug line
                     status_emoji = "✅" if correct_flag else "❌"
                     correct_idx_server = result.get("correctIndex")
                     correct_server_text = ""
@@ -1094,7 +1129,6 @@ class MiniPixV2:
                             continue
                         if "result" in next_info:
                             break
-                        # Sometimes next is directly the question
                         if next_info.get("questionId"):
                             question_obj = next_info
                             session_id = result.get("sessionId") or session_id
@@ -1108,7 +1142,6 @@ class MiniPixV2:
                             continue
                         else:
                             break
-
                     break
                 else:
                     break
